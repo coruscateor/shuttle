@@ -1,8 +1,7 @@
 use crate::{build::Build, BuildSystem, ShuttleFactory};
 use anyhow::{anyhow, Context as AnyhowContext};
 use core::default::Default;
-use shuttle_common::project::ProjectConfig;
-use shuttle_common::{DeploymentApiError, DeploymentId, DeploymentMeta, DeploymentStateMeta, Host, Port};
+use shuttle_common::{DeploymentApiError, project::ProjectName, DeploymentId, DeploymentMeta, DeploymentStateMeta, Host, Port};
 use libloading::Library;
 use rocket::data::ByteUnit;
 use rocket::tokio;
@@ -45,9 +44,9 @@ impl Deployment {
         }
     }
 
-    fn from_bytes(config: &ProjectConfig, crate_bytes: Vec<u8>) -> Self {
+    fn from_bytes(project: ProjectName, crate_bytes: Vec<u8>) -> Self {
         Self {
-            meta: Arc::new(RwLock::new(DeploymentMeta::queued(config))),
+            meta: Arc::new(RwLock::new(DeploymentMeta::queued(project))),
             state: RwLock::new(DeploymentState::queued(crate_bytes)),
         }
     }
@@ -58,7 +57,8 @@ impl Deployment {
         let project_name = dir
             .file_name()
             .into_string()
-            .map_err(|os_str| anyhow!("could not parse project name `{:?}` to string", os_str))?;
+            .map_err(|err| anyhow!("invalid project name: {:?}", err))
+            .and_then(|name| name.parse::<ProjectName>().map_err(|err| err.into()))?;
         // find marker which points to so file
         let marker_path = project_path.join(".shuttle_marker");
         let so_path_str = std::fs::read(&marker_path)
@@ -68,7 +68,7 @@ impl Deployment {
             .parse()
             .context("could not parse contents of marker file to a valid path")?;
 
-        let meta = DeploymentMeta::built(&ProjectConfig::new(project_name)?);
+        let meta = DeploymentMeta::built(project_name);
         let state = DeploymentState::built(Build { so_path });
         Ok(Self::new(meta, state))
     }
@@ -111,7 +111,7 @@ impl Deployment {
                     let console_writer = BuildOutputWriter::new(self.meta.clone());
                     match context
                         .build_system
-                        .build(&queued.crate_bytes, &meta.config, Box::new(console_writer))
+                        .build(&queued.crate_bytes, meta.project.as_str(), Box::new(console_writer))
                         .await
                     {
                         Ok(build) => DeploymentState::built(build),
@@ -144,8 +144,8 @@ impl Deployment {
                         port
                     );
 
-                    debug!("{}: factory phase", meta.config.name());
-                    let mut db_state = database::State::new(&meta.config, db_context);
+                    debug!("{}: factory phase", meta.project);
+                    let mut db_state = database::State::new(&meta.project, db_context);
 
                     // Pre-emptively allocate a dabatase to work around a deadlock issue with sqlx connection pools
                     // When .build is called, the db_context's connection pool and the inner connection pool instantiated
@@ -155,15 +155,19 @@ impl Deployment {
                     self.meta.write().await.database_deployment = Some(db_state.request());
 
                     match db_state.ensure().await {
-                        Err(e) => DeploymentState::Error(e.into()),
+                        Err(e) => {
+                            debug!("{}: db state failed: {:?}", meta.project, e);
+                            let err: anyhow::Error = e.into();
+                            DeploymentState::Error(err.context(anyhow!("failed to attach database")))
+                        },
                         Ok(()) => {
                             let mut factory = ShuttleFactory::new(&mut db_state);
                             match loaded.service.build(&mut factory) {
                                 Err(e) => {
-                                    debug!("{}: factory phase FAILED: {:?}", meta.config.name(), e);
+                                    debug!("{}: factory phase FAILED: {:?}", meta.project, e);
                                     DeploymentState::Error(e.into()) },
                                 Ok(_) => {
-                                    debug!("{}: factory phase DONE", meta.config.name());
+                                    debug!("{}: factory phase DONE", meta.project);
                                     // TODO: upon resolving this future, change the status of the deployment
                                     // We cannot use spawn here since that blocks the api completely. We suspect this is because `bind` makes a blocking call,
                                     // however that does not completely makes sense as the blocking call is made on another runtime.
@@ -429,12 +433,12 @@ impl DeploymentSystem {
     /// for a given project, will return the latest.
     pub(crate) async fn get_deployment_for_project(
         &self,
-        project_name: &str,
+        project_name: &ProjectName,
     ) -> Result<DeploymentMeta, DeploymentApiError> {
         let mut candidates = Vec::new();
 
         for deployment in self.deployments.read().await.values() {
-            if deployment.meta.read().await.config.name() == project_name {
+            if deployment.meta.read().await.project == *project_name {
                 candidates.push(deployment.meta().await);
             }
         }
@@ -454,7 +458,7 @@ impl DeploymentSystem {
 
     pub(crate) async fn kill_deployment_for_project(
         &self,
-        project_name: &str,
+        project_name: &ProjectName,
     ) -> Result<DeploymentMeta, DeploymentApiError> {
         let id = self.get_deployment_for_project(project_name).await?.id;
         self.kill_deployment(&id).await
@@ -515,7 +519,7 @@ impl DeploymentSystem {
     pub(crate) async fn deploy(
         &self,
         crate_file: Data<'_>,
-        project_config: &ProjectConfig,
+        project: ProjectName,
     ) -> Result<DeploymentMeta, DeploymentApiError> {
         // Assumes that only `::Deployed` deployments are blocking a thread.
         if self.num_active().await >= MAX_DEPLOYS {
@@ -533,7 +537,7 @@ impl DeploymentSystem {
             })?
             .to_vec();
 
-        let deployment = Arc::new(Deployment::from_bytes(project_config, crate_bytes));
+        let deployment = Arc::new(Deployment::from_bytes(project, crate_bytes));
 
         let info = deployment.meta().await;
 

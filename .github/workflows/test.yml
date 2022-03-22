@@ -22,7 +22,7 @@ jobs:
       - name: Make config file
         run: mkdir -p ~/.config/shuttle/ && echo "api_key = \"ci-test\"" > ~/.config/shuttle/config.toml
       - name: Use local shuttle-service
-        run: mkdir -p ~/.cargo && echo -e "[patch.crates-io]\nshuttle-service = { path = \"${GITHUB_WORKSPACE}/service\" }" > ~/.cargo/config.toml
+        run: mkdir -p ${GITHUB_WORKSPACE}/.cargo && echo -e "[patch.crates-io]\nshuttle-service = { path = \"${GITHUB_WORKSPACE}/service\" }" > ${GITHUB_WORKSPACE}/.cargo/config.toml
       - name: Build docker
         run: docker build -f ./Dockerfile.dev .
       - run: cargo test -- --nocapture
